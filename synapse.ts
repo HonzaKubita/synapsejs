@@ -17,16 +17,18 @@
 // 2. Initialization of the default values for the properties of a new synapse object
 // 3. Definition of the methods for synapse object (all of these methods are shared in between all synapse instances,
 // with the use of function.bind to swap the target under `this` so the correct synapse is affected)
-class SynapseBase<T> {
+export class SynapseBase<T> {
   _isSynapse: true;
   // Synapse properties
   _keySubscribers: Partial<Record<keyof T, Array<() => void>>>;
   _subscribers: Array<() => void>;
+  _connections: Map<Synapse<unknown>, () => {}>;
 
   constructor() {
     this._isSynapse = true;
     this._keySubscribers = {};
     this._subscribers = [];
+    this._connections = new Map();
   }
 
   subscribe(subscriber: () => void) {
@@ -87,6 +89,28 @@ class SynapseBase<T> {
       }
     }
   }
+
+  connectTo(s: Synapse<unknown>, key?: keyof T) {
+    // Create a single global scope subscriber
+    const connectionHandler = () => {
+      // That causes a global update of target
+      this.trigger();
+      // And an update of that specific key
+      if (key) {
+        this.triggerKey(key);
+      }
+    };
+
+    // Subscribe to all changes in the child object
+    s.subscribe(connectionHandler);
+  }
+
+  disconnectFrom(s: Synapse<unknown>) {
+    const connectionHandler = this._connections.get(s);
+    if (connectionHandler) {
+      s.unsubscribe(connectionHandler);
+    }
+  }
 }
 
 // Type wrapper because of usage of manual property and method injection
@@ -95,77 +119,92 @@ export type Synapse<T> = SynapseBase<T> & T;
 
 export type SynapseConfig = {
   subscribeToInnerInitial: boolean;
+  convertInnerInitial: boolean;
   subscribeToInnerAssigned: boolean;
-  convertInitial: boolean;
 };
 
-const DEFAULT_CONFIG: SynapseConfig = {
+export const DEFAULT_CONFIG: SynapseConfig = {
   subscribeToInnerInitial: true,
+  convertInnerInitial: true,
   subscribeToInnerAssigned: true,
-  convertInitial: true,
 } as const;
 
-function isSynapseObject<O extends any>(o: O): o is O & SynapseBase<O> {
+export function isSynapseObject<O extends any>(o: O): o is O & SynapseBase<O> {
   return typeof o === "object" && o !== null && Object.hasOwn(o, "_isSynapse");
 }
 
-export function synapse<T extends object>(
+// Injects base synapse properties and methods to an object and returns the object
+export function injectBaseSynapse<T extends object>(
   targetObject: T,
-  config?: Partial<SynapseConfig>,
 ): Synapse<T> {
-  // Don't allow creating synapses of synapses
-  // convertInitial is dependent on this logic because it automatically converts _every_ object
-  if (isSynapseObject(targetObject)) {
-    return targetObject;
-  }
-
-  const cfg = { ...DEFAULT_CONFIG, ...config };
-
   // Apply are the synapse methods to the object
   const base = new SynapseBase();
   // Copy properties
   Object.assign(targetObject, base);
   // Copy and bind all methods
-  const baseKeys = Object.keys(base) as (keyof SynapseBase<T>)[];
-  for (let i = 0; i < baseKeys.length; i++) {
-    const key = baseKeys[i];
+  const basePrototype = Object.getPrototypeOf(base);
+  const methods = Object.getOwnPropertyNames(
+    basePrototype,
+  ) as (keyof SynapseBase<T>)[];
+  for (let i = 0; i < methods.length; i++) {
+    const key = methods[i];
     const value = base[key];
     if (typeof value === "function") {
       (targetObject as any)[key] = value.bind(targetObject);
     }
   }
 
-  const synapseObject = targetObject as T & SynapseBase<T>;
+  return targetObject as Synapse<T>;
+}
 
-  if (cfg.subscribeToInnerInitial || cfg.convertInitial) {
-    // Copy over all the values from the initial value
-    // while creating subscriptions for synapse objects
+export function synapse<T extends object>(
+  targetObject: T,
+  config?: Partial<SynapseConfig>,
+): Synapse<T> {
+  console.log("Creating synapse for: ", targetObject);
 
-    // Idk if this can be done in a faster way (probably yes)
-    // previously used Object.assign but then can't check for instances of synapses
-    const initialKeys = Object.keys(synapseObject) as (keyof T)[];
+  // Don't allow injecting synapse bases to already injected objects
+  // convertInnerInitial is dependent on this logic because it automatically converts _every_ object
+  if (isSynapseObject(targetObject)) {
+    return targetObject;
+  }
 
-    for (let i = 0; i < initialKeys.length; i++) {
-      const initialKey = initialKeys[i];
-      let valueOfKey = synapseObject[initialKey];
+  const cfg = { ...DEFAULT_CONFIG, ...config };
 
-      if (cfg.convertInitial && valueOfKey instanceof Object) {
-        // If the value is an object and synapse conversion is enabled convert the value to a synapse
-        valueOfKey = synapse(valueOfKey);
+  const innerSynapses: Synapse<unknown>[] = [];
+
+  if (cfg.convertInnerInitial || cfg.subscribeToInnerInitial) {
+    // Loop over all the initial object keys
+    const targetKeys = Object.keys(targetObject) as (keyof T)[];
+    for (let i = 0; i < targetKeys.length; i++) {
+      const targetKey = targetKeys[i];
+
+      // If conversion of inner objects is enabled
+      // convert the object to a synapse
+      if (
+        cfg.convertInnerInitial &&
+        targetObject[targetKey] instanceof Object &&
+        typeof targetObject[targetKey] !== "function"
+      ) {
+        targetObject[targetKey] = synapse(targetObject[targetKey], config);
       }
 
-      // Bypass strict intersection assignment checks
-      (synapseObject as any)[initialKey] = valueOfKey;
-
-      if (cfg.subscribeToInnerInitial && isSynapseObject(valueOfKey)) {
-        // Create a single global scope subscriber
-        valueOfKey.subscribe(() => {
-          // That causes a global update of target
-          synapseObject.trigger.bind(synapseObject)();
-          // And an update of that specific key
-          synapseObject.triggerKey.bind(synapseObject, initialKey)();
-        });
+      // If subscribing to inner synapses is enabled
+      // subscribe to the changes of that inner synapse
+      if (
+        cfg.subscribeToInnerInitial &&
+        isSynapseObject(targetObject[targetKey])
+      ) {
+        innerSynapses.push(targetObject[targetKey] as Synapse<unknown>);
       }
+    }
+  }
+
+  const synapseObject = injectBaseSynapse(targetObject);
+
+  if (cfg.subscribeToInnerInitial) {
+    for (const innerSynapse of innerSynapses) {
+      synapseObject.connectTo(innerSynapse);
     }
   }
 
@@ -178,28 +217,46 @@ export function synapse<T extends object>(
       // I assume something will be super broken if this assertion wasn't true
       const key = prop as keyof T;
 
+      const oldValue = target[key];
+
+      // Inner unsubscribe logic
+      if (isSynapseObject(oldValue)) {
+        target.disconnectFrom(oldValue);
+      }
+
+      // Inner subscribe logic
+      if (cfg.subscribeToInnerAssigned) {
+        // Check if the value getting set is a synapse
+        // if so connect to it
+        if (isSynapseObject(newValue)) {
+          target.connectTo(newValue);
+        }
+      }
+
+      // Run the internal set method and store the outcome
+      const reflectResult = Reflect.set(...args);
+
+      // Note: it is important the triggers are called after Reflect.set
+      // because the updates don't carry the new value and any subscriber
+      // sees only the current value of the variable
+
       // Execute global trigger on the synapse
       target.trigger();
 
       // Execute key trigger on the synapse
       target.triggerKey(key);
 
-      if (cfg.subscribeToInnerAssigned) {
-        // Check if the value getting set is a synapse
-        // if so connect to it
-        if (isSynapseObject(newValue)) {
-          // Create a single global scope subscriber
-          newValue.subscribe(() => {
-            // That causes a global update of target
-            target.trigger.bind(target)();
-            // And an update of that specific key
-            target.triggerKey.bind(target, key)();
-          });
-        }
+      // Return the outcome of the actual set method
+      return reflectResult;
+    },
+    deleteProperty(...args) {
+      // Handle subscription deletion on property deletion
+      const [target, prop] = args;
+      const key = prop as keyof T;
+      if (isSynapseObject(target[key])) {
+        target.disconnectFrom(target[key]);
       }
-
-      // Actually run the internal set method
-      return Reflect.set(...args);
+      return Reflect.deleteProperty(...args);
     },
   });
 }
