@@ -161,8 +161,6 @@ export function synapse<T extends object>(
   targetObject: T,
   config?: Partial<SynapseConfig>,
 ): Synapse<T> {
-  console.log("Creating synapse for: ", targetObject);
-
   // Don't allow injecting synapse bases to already injected objects
   // convertInnerInitial is dependent on this logic because it automatically converts _every_ object
   if (isSynapseObject(targetObject)) {
